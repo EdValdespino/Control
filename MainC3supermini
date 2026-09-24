@@ -1,0 +1,94 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+// We use a MAC address because it acts like a unique ID (or phone number)
+// ESP-NOW needs it to know exactly which device will receive our data
+uint8_t receiverMac[] = {0x58, 0x8C, 0x81, 0x3B, 0xBD, 0x54};
+
+// Safer pins for the C3 SuperMini
+const int btnLeft = 0;
+const int btnRight = 1;
+const int btnCancel = 2;
+const int btnLamp = 3;
+const int btnHazard = 4;
+
+// We use 'bool' (true/false) because a button only has two physical states: 
+// unpressed (HIGH) or pressed (LOW). It is the most memory-efficient data type for this.
+bool prevLeft = HIGH, prevRight = HIGH;
+bool prevCancel = HIGH, prevLamp = HIGH, prevHazard = HIGH;
+
+// A 'struct' is used to package multiple variables into a single block of data. 
+// This allows us to send the state of all 5 buttons together in one single message.
+typedef struct control_message {
+  bool clickLeft;
+  bool clickRight;
+  bool clickCancel;
+  bool clickLamp;
+  bool clickHazard;
+} control_message;
+
+control_message dataToSend;
+esp_now_peer_info_t receiverInfo;
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Silent confirmation function
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // INPUT_PULLUP keeps the pin state HIGH automatically using an internal resistor. 
+  // When you physically press the button, it connects to ground and goes LOW.
+  pinMode(btnLeft, INPUT_PULLUP);
+  pinMode(btnRight, INPUT_PULLUP);
+  pinMode(btnCancel, INPUT_PULLUP);
+  pinMode(btnLamp, INPUT_PULLUP);
+  pinMode(btnHazard, INPUT_PULLUP);
+
+  WiFi.mode(WIFI_MODE_STA);
+  
+  esp_now_init();
+  esp_now_register_send_cb((esp_now_send_cb_t)onDataSent);
+
+  // We register the receiver device using its MAC address so the ESP32 knows where to send the data.
+  memcpy(receiverInfo.peer_addr, receiverMac, 6);
+  receiverInfo.channel = 0;  
+  receiverInfo.encrypt = false;
+  esp_now_add_peer(&receiverInfo);
+}
+
+void loop() {
+  bool currentLeft = digitalRead(btnLeft);
+  bool currentRight = digitalRead(btnRight);
+  bool currentCancel = digitalRead(btnCancel);
+  bool currentLamp = digitalRead(btnLamp);
+  bool currentHazard = digitalRead(btnHazard);
+
+  bool shouldSend = false;
+  
+  dataToSend = {false, false, false, false, false};
+
+  // We compare the current state (LOW) with the previous state (HIGH).
+  // This logic ensures we only send ONE message at the exact moment the button is clicked,
+  // preventing a flood of messages if the user holds the button down.
+  if (currentLeft == LOW && prevLeft == HIGH) { dataToSend.clickLeft = true; shouldSend = true; }
+  if (currentRight == LOW && prevRight == HIGH) { dataToSend.clickRight = true; shouldSend = true; }
+  if (currentCancel == LOW && prevCancel == HIGH) { dataToSend.clickCancel = true; shouldSend = true; }
+  if (currentLamp == LOW && prevLamp == HIGH) { dataToSend.clickLamp = true; shouldSend = true; }
+  if (currentHazard == LOW && prevHazard == HIGH) { dataToSend.clickHazard = true; shouldSend = true; }
+
+  if (shouldSend) {
+    esp_now_send(receiverMac, (uint8_t *) &dataToSend, sizeof(dataToSend));
+    // A small delay to ignore "bouncing" (electrical noise when the metal contacts of the button touch)
+    delay(200); 
+  }
+
+  // Update previous states so the program remembers them for the next loop
+  prevLeft = currentLeft;
+  prevRight = currentRight;
+  prevCancel = currentCancel;
+  prevLamp = currentLamp;
+  prevHazard = currentHazard;
+
+  delay(10);
+}
