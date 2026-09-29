@@ -10,7 +10,7 @@ const int btnLeft = 0;
 const int btnRight = 1;
 const int btnCancel = 2;
 const int btnLamp = 3;
-const int btnHazard = 11; // Movido del pin 4 al pin 11 (Digital)
+const int btnHazard = 11; // Pin digital libre
 
 // LEDs de los botones
 const int ledLeft = 12;
@@ -19,18 +19,18 @@ const int ledCancel = 14;
 const int ledLamp = 15;
 const int ledHazard = 16;
 
-// Batería
+// Batería y LED de Estado
 const int pinBattery = 4; // Pin del divisor de voltaje (ADC1)
-const int ledBatteryAlert = 10; // Pin libre para el LED que parpadeará (<30%)
+const int ledStatus = 10; // Único LED para Encendido y Batería Baja
 
 // Variables de estado
 bool prevLeft = HIGH, prevRight = HIGH;
 bool prevCancel = HIGH, prevLamp = HIGH, prevHazard = HIGH;
 
-// Variables para millis() (Evitan usar delay y bloquear el programa)
+// Variables para millis()
 unsigned long prevBlinkMillis = 0;
 unsigned long prevSendMillis = 0;
-bool alertLedState = LOW;
+bool alertLedState = HIGH; // Iniciamos en HIGH (encendido)
 
 // --- ESTRUCTURA DE DATOS ESP-NOW ---
 typedef struct control_message {
@@ -39,7 +39,7 @@ typedef struct control_message {
   bool clickCancel;
   bool clickLamp;
   bool clickHazard;
-  uint8_t batteryPercent; // Nuevo campo para el porcentaje de batería
+  uint8_t batteryPercent; 
 } control_message;
 
 control_message dataToSend;
@@ -65,7 +65,10 @@ void setup() {
   pinMode(ledCancel, OUTPUT);
   pinMode(ledLamp, OUTPUT);
   pinMode(ledHazard, OUTPUT);
-  pinMode(ledBatteryAlert, OUTPUT);
+  pinMode(ledStatus, OUTPUT); // LED de estado unificado
+
+  // Encendemos el LED de estado al arrancar
+  digitalWrite(ledStatus, HIGH);
 
   // Configuración de la resolución analógica (12 bits: 0 a 4095)
   analogReadResolution(12);
@@ -85,13 +88,11 @@ void loop() {
 
   // 1. LECTURA DE BATERÍA (Divisor 100k/100k)
   int adcValue = analogRead(pinBattery);
-  // Convertimos el valor ADC a voltaje (asumiendo referencia interna de ~3.3V)
   float pinVoltage = (adcValue * 3.3) / 4095.0; 
-  float batVoltage = pinVoltage * 2.0; // Multiplicamos por 2 debido al divisor de voltaje
+  float batVoltage = pinVoltage * 2.0; 
   
-  // Calculamos porcentaje (Batería LiPo: 3.2V = 0%, 4.2V = 100%)
   int batPercent = (batVoltage - 3.2) * 100.0 / (4.2 - 3.2);
-  batPercent = constrain(batPercent, 0, 100); // Mantiene el valor entre 0 y 100
+  batPercent = constrain(batPercent, 0, 100); 
 
   // 2. LECTURA DE BOTONES
   bool currentLeft = digitalRead(btnLeft);
@@ -101,36 +102,38 @@ void loop() {
   bool currentHazard = digitalRead(btnHazard);
 
   // 3. CONTROL DE LOS LEDs DE LOS BOTONES
-  // Si el botón está presionado (LOW), se invierte a HIGH (true) y el LED enciende
   digitalWrite(ledLeft, !currentLeft);
   digitalWrite(ledRight, !currentRight);
   digitalWrite(ledCancel, !currentCancel);
   digitalWrite(ledLamp, !currentLamp);
   digitalWrite(ledHazard, !currentHazard);
 
-  // 4. ALERTA DE BATERÍA BAJA (<30%)
+  // 4. CONTROL DEL LED DE ESTADO UNIFICADO (Pin 10)
   if (batPercent < 30) {
-    if (currentMillis - prevBlinkMillis >= 500) { // Parpadea cada 500ms
+    // Parpadea si la batería está baja (< 30%)
+    if (currentMillis - prevBlinkMillis >= 500) { 
       prevBlinkMillis = currentMillis;
       alertLedState = !alertLedState;
-      digitalWrite(ledBatteryAlert, alertLedState);
+      digitalWrite(ledStatus, alertLedState);
     }
   } else {
-    digitalWrite(ledBatteryAlert, LOW); // Lo apaga si la batería es >= 30%
+    // Se mantiene fijo si la batería tiene buena carga (>= 30%)
+    digitalWrite(ledStatus, HIGH);
+    alertLedState = HIGH; // Sincronizamos la variable por si acaso
   }
 
   // 5. PREPARACIÓN DE DATOS ESP-NOW
   bool shouldSend = false;
   dataToSend = {false, false, false, false, false, (uint8_t)batPercent};
 
-  // Detectar clics exactos para enviar datos
+  // Detectar clics
   if (currentLeft == LOW && prevLeft == HIGH) { dataToSend.clickLeft = true; shouldSend = true; }
   if (currentRight == LOW && prevRight == HIGH) { dataToSend.clickRight = true; shouldSend = true; }
   if (currentCancel == LOW && prevCancel == HIGH) { dataToSend.clickCancel = true; shouldSend = true; }
   if (currentLamp == LOW && prevLamp == HIGH) { dataToSend.clickLamp = true; shouldSend = true; }
   if (currentHazard == LOW && prevHazard == HIGH) { dataToSend.clickHazard = true; shouldSend = true; }
 
-  // Envío periódico cada 10 segundos (para actualizar la batería en el receptor aunque no se presionen botones)
+  // Latido cada 10 segundos
   if (currentMillis - prevSendMillis >= 10000) {
     shouldSend = true;
     prevSendMillis = currentMillis;
@@ -140,13 +143,12 @@ void loop() {
   if (shouldSend) {
     esp_now_send(receiverMac, (uint8_t *) &dataToSend, sizeof(dataToSend));
     
-    // Solo aplicamos debounce si el envío fue provocado por un botón
     if (dataToSend.clickLeft || dataToSend.clickRight || dataToSend.clickCancel || dataToSend.clickLamp || dataToSend.clickHazard) {
       delay(200); 
     }
   }
 
-  // Actualizar estados anteriores
+  // Actualizar estados
   prevLeft = currentLeft;
   prevRight = currentRight;
   prevCancel = currentCancel;
