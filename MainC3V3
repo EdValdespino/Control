@@ -1,0 +1,157 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+// MAC address del receptor
+uint8_t receiverMac[] = {0x58, 0x8C, 0x81, 0x3B, 0xBD, 0x54};
+
+// --- CONFIGURACIÓN DE PINES ---
+// Botones
+const int btnLeft = 0;
+const int btnRight = 1;
+const int btnCancel = 2;
+const int btnLamp = 3;
+const int btnHazard = 11; // Movido del pin 4 al pin 11 (Digital)
+
+// LEDs de los botones
+const int ledLeft = 12;
+const int ledRight = 13;
+const int ledCancel = 14;
+const int ledLamp = 15;
+const int ledHazard = 16;
+
+// Batería
+const int pinBattery = 4; // Pin del divisor de voltaje (ADC1)
+const int ledBatteryAlert = 10; // Pin libre para el LED que parpadeará (<30%)
+
+// Variables de estado
+bool prevLeft = HIGH, prevRight = HIGH;
+bool prevCancel = HIGH, prevLamp = HIGH, prevHazard = HIGH;
+
+// Variables para millis() (Evitan usar delay y bloquear el programa)
+unsigned long prevBlinkMillis = 0;
+unsigned long prevSendMillis = 0;
+bool alertLedState = LOW;
+
+// --- ESTRUCTURA DE DATOS ESP-NOW ---
+typedef struct control_message {
+  bool clickLeft;
+  bool clickRight;
+  bool clickCancel;
+  bool clickLamp;
+  bool clickHazard;
+  uint8_t batteryPercent; // Nuevo campo para el porcentaje de batería
+} control_message;
+
+control_message dataToSend;
+esp_now_peer_info_t receiverInfo;
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Función de confirmación silenciosa
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  // Configuración de botones
+  pinMode(btnLeft, INPUT_PULLUP);
+  pinMode(btnRight, INPUT_PULLUP);
+  pinMode(btnCancel, INPUT_PULLUP);
+  pinMode(btnLamp, INPUT_PULLUP);
+  pinMode(btnHazard, INPUT_PULLUP);
+
+  // Configuración de LEDs
+  pinMode(ledLeft, OUTPUT);
+  pinMode(ledRight, OUTPUT);
+  pinMode(ledCancel, OUTPUT);
+  pinMode(ledLamp, OUTPUT);
+  pinMode(ledHazard, OUTPUT);
+  pinMode(ledBatteryAlert, OUTPUT);
+
+  // Configuración de la resolución analógica (12 bits: 0 a 4095)
+  analogReadResolution(12);
+
+  WiFi.mode(WIFI_MODE_STA);
+  esp_now_init();
+  esp_now_register_send_cb((esp_now_send_cb_t)onDataSent);
+
+  memcpy(receiverInfo.peer_addr, receiverMac, 6);
+  receiverInfo.channel = 0;  
+  receiverInfo.encrypt = false;
+  esp_now_add_peer(&receiverInfo);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // 1. LECTURA DE BATERÍA (Divisor 100k/100k)
+  int adcValue = analogRead(pinBattery);
+  // Convertimos el valor ADC a voltaje (asumiendo referencia interna de ~3.3V)
+  float pinVoltage = (adcValue * 3.3) / 4095.0; 
+  float batVoltage = pinVoltage * 2.0; // Multiplicamos por 2 debido al divisor de voltaje
+  
+  // Calculamos porcentaje (Batería LiPo: 3.2V = 0%, 4.2V = 100%)
+  int batPercent = (batVoltage - 3.2) * 100.0 / (4.2 - 3.2);
+  batPercent = constrain(batPercent, 0, 100); // Mantiene el valor entre 0 y 100
+
+  // 2. LECTURA DE BOTONES
+  bool currentLeft = digitalRead(btnLeft);
+  bool currentRight = digitalRead(btnRight);
+  bool currentCancel = digitalRead(btnCancel);
+  bool currentLamp = digitalRead(btnLamp);
+  bool currentHazard = digitalRead(btnHazard);
+
+  // 3. CONTROL DE LOS LEDs DE LOS BOTONES
+  // Si el botón está presionado (LOW), se invierte a HIGH (true) y el LED enciende
+  digitalWrite(ledLeft, !currentLeft);
+  digitalWrite(ledRight, !currentRight);
+  digitalWrite(ledCancel, !currentCancel);
+  digitalWrite(ledLamp, !currentLamp);
+  digitalWrite(ledHazard, !currentHazard);
+
+  // 4. ALERTA DE BATERÍA BAJA (<30%)
+  if (batPercent < 30) {
+    if (currentMillis - prevBlinkMillis >= 500) { // Parpadea cada 500ms
+      prevBlinkMillis = currentMillis;
+      alertLedState = !alertLedState;
+      digitalWrite(ledBatteryAlert, alertLedState);
+    }
+  } else {
+    digitalWrite(ledBatteryAlert, LOW); // Lo apaga si la batería es >= 30%
+  }
+
+  // 5. PREPARACIÓN DE DATOS ESP-NOW
+  bool shouldSend = false;
+  dataToSend = {false, false, false, false, false, (uint8_t)batPercent};
+
+  // Detectar clics exactos para enviar datos
+  if (currentLeft == LOW && prevLeft == HIGH) { dataToSend.clickLeft = true; shouldSend = true; }
+  if (currentRight == LOW && prevRight == HIGH) { dataToSend.clickRight = true; shouldSend = true; }
+  if (currentCancel == LOW && prevCancel == HIGH) { dataToSend.clickCancel = true; shouldSend = true; }
+  if (currentLamp == LOW && prevLamp == HIGH) { dataToSend.clickLamp = true; shouldSend = true; }
+  if (currentHazard == LOW && prevHazard == HIGH) { dataToSend.clickHazard = true; shouldSend = true; }
+
+  // Envío periódico cada 10 segundos (para actualizar la batería en el receptor aunque no se presionen botones)
+  if (currentMillis - prevSendMillis >= 10000) {
+    shouldSend = true;
+    prevSendMillis = currentMillis;
+  }
+
+  // 6. TRANSMISIÓN
+  if (shouldSend) {
+    esp_now_send(receiverMac, (uint8_t *) &dataToSend, sizeof(dataToSend));
+    
+    // Solo aplicamos debounce si el envío fue provocado por un botón
+    if (dataToSend.clickLeft || dataToSend.clickRight || dataToSend.clickCancel || dataToSend.clickLamp || dataToSend.clickHazard) {
+      delay(200); 
+    }
+  }
+
+  // Actualizar estados anteriores
+  prevLeft = currentLeft;
+  prevRight = currentRight;
+  prevCancel = currentCancel;
+  prevLamp = currentLamp;
+  prevHazard = currentHazard;
+
+  delay(10);
+}
