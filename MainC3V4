@@ -1,0 +1,120 @@
+#include <esp_now.h>
+#include <WiFi.h>
+
+// MAC del Casco
+uint8_t receiverMac[] = {0x9C, 0xCC, 0x01, 0x7C, 0x46, 0x3C};
+
+// --- CONFIGURACIÓN DE PINES 100% SEGUROS ---
+const int btnRight = 10;   
+const int btnCancel = 1;   
+const int btnLamp = 2;     
+const int btnLeft = 3;     
+const int btnHazard = 4;   
+
+const int pinBattery = 0;  
+
+// Variables de estado
+bool prevLeft = HIGH, prevRight = HIGH;
+bool prevCancel = HIGH, prevLamp = HIGH, prevHazard = HIGH;
+unsigned long prevSendMillis = 0;
+
+// ESTRUCTURA CON LA BATERÍA
+typedef struct control_message {
+  bool clickLeft;
+  bool clickRight;
+  bool clickCancel;
+  bool clickLamp;
+  bool clickHazard;
+  uint8_t batteryPercent; 
+} control_message;
+
+control_message dataToSend;
+esp_now_peer_info_t receiverInfo;
+
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  // Confirmación silenciosa
+}
+
+void setup() {
+  Serial.begin(115200); 
+  
+  pinMode(btnLeft, INPUT_PULLUP);
+  pinMode(btnRight, INPUT_PULLUP);
+  pinMode(btnCancel, INPUT_PULLUP);
+  pinMode(btnLamp, INPUT_PULLUP);
+  pinMode(btnHazard, INPUT_PULLUP);
+
+  analogReadResolution(12);
+
+  WiFi.mode(WIFI_MODE_STA);
+  esp_now_init();
+  esp_now_register_send_cb((esp_now_send_cb_t)onDataSent);
+
+  memcpy(receiverInfo.peer_addr, receiverMac, 6);
+  receiverInfo.channel = 0;  
+  receiverInfo.encrypt = false;
+  esp_now_add_peer(&receiverInfo);
+}
+
+void loop() {
+  unsigned long currentMillis = millis();
+
+  // 1. LECTURA DE BATERÍA
+  int adcValue = analogRead(pinBattery);
+  float pinVoltage = (adcValue * 3.3) / 4095.0; 
+  float batVoltage = pinVoltage * 2.0; 
+  int batPercent = (batVoltage - 3.2) * 100.0 / (4.2 - 3.2);
+  batPercent = constrain(batPercent, 0, 100); 
+
+  // 2. LECTURA DE BOTONES
+  bool currentLeft = digitalRead(btnLeft);
+  bool currentRight = digitalRead(btnRight);
+  bool currentCancel = digitalRead(btnCancel);
+  bool currentLamp = digitalRead(btnLamp);
+  bool currentHazard = digitalRead(btnHazard);
+
+  bool shouldSend = false;
+  dataToSend = {false, false, false, false, false, (uint8_t)batPercent};
+
+  // 3. DETECTAR CLICS (CON LÓGICA DE COMBINACIÓN CANCEL+HAZARD)
+  if (currentLeft == LOW && prevLeft == HIGH) { dataToSend.clickLeft = true; shouldSend = true; }
+  if (currentRight == LOW && prevRight == HIGH) { dataToSend.clickRight = true; shouldSend = true; }
+  if (currentLamp == LOW && prevLamp == HIGH) { dataToSend.clickLamp = true; shouldSend = true; }
+
+  // Si presionamos Cancel...
+  if (currentCancel == LOW && prevCancel == HIGH) { 
+    dataToSend.clickCancel = true; 
+    shouldSend = true; 
+    // Si Hazard ya estaba presionado, lo sumamos al paquete
+    if (currentHazard == LOW) dataToSend.clickHazard = true;
+  }
+  
+  // Si presionamos Hazard...
+  if (currentHazard == LOW && prevHazard == HIGH) { 
+    dataToSend.clickHazard = true; 
+    shouldSend = true; 
+    // Si Cancel ya estaba presionado, lo sumamos al paquete (¡Esto es lo que pediste!)
+    if (currentCancel == LOW) dataToSend.clickCancel = true;
+  }
+
+  // 4. TRANSMISIÓN
+  if (currentMillis - prevSendMillis >= 10000) {
+    shouldSend = true;
+    prevSendMillis = currentMillis;
+  }
+
+  if (shouldSend) {
+    esp_now_send(receiverMac, (uint8_t *) &dataToSend, sizeof(dataToSend));
+    if (dataToSend.clickLeft || dataToSend.clickRight || dataToSend.clickCancel || dataToSend.clickLamp || dataToSend.clickHazard) {
+      delay(50); 
+    }
+  }
+
+  prevLeft = currentLeft;
+  prevRight = currentRight;
+  prevCancel = currentCancel;
+  prevLamp = currentLamp;
+  prevHazard = currentHazard;
+
+  delay(10);
+}
