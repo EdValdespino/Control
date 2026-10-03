@@ -12,40 +12,40 @@ const int btnHazard = 3;
 const int btnLeft = 21;
 const int pinBattery = 4; // ADC1
 
-// LEDs
 const int ledLamp = 5;       
 const int ledHazard = 6;      
 const int ledCancel = 7;  
 const int ledRight = 10;
 const int ledLeft = 20;
 
-// Variables de estado de los botones
+// Variables de estado
 bool prevLeft = HIGH, prevRight = HIGH;
 bool prevCancel = HIGH, prevLamp = HIGH, prevHazard = HIGH;
-
-// Variables Modo Día y Pulsación Larga (Lámpara)
 bool isDayMode = false;          
 bool localLampState = false;     
 unsigned long lampPressTime = 0; 
 bool lampLongPressed = false;    
 
-// Variables de estado interno para LEDs
 enum DirectionState { STATE_OFF, STATE_LEFT, STATE_RIGHT, STATE_HAZARD };
 DirectionState currentState = STATE_OFF;
 
-// Temporizadores
 unsigned long previousTime = 0;
 unsigned long prevFastBlink = 0;
 unsigned long prevSendMillis = 0;
-unsigned long prevSerialMillis = 0; // NUEVO: Temporizador para el Monitor Serial
+unsigned long prevSerialMillis = 0; 
 const int blinkInterval = 400; 
 bool flashState = false;
 bool fastFlashState = false;
-
-// Variable para el combo SOS
 bool comboSosSent = false; 
 
-// Estructura de datos ESP-NOW
+// --- VARIABLES SOS (Recibidas del Casco) ---
+bool isHelmetSOS = false;
+const int sosPattern[] = {150, 150, 150, 150, 150, 450, 450, 150, 450, 150, 450, 450, 150, 150, 150, 150, 150, 1400};
+const int sosPatternLength = 18;
+int sosIndex = 0;
+unsigned long previousSosTime = 0;
+
+// Estructuras de datos ESP-NOW
 typedef struct control_message {
   bool clickLeft;
   bool clickRight;
@@ -55,12 +55,26 @@ typedef struct control_message {
   uint8_t batteryPercent; 
 } control_message;
 
+typedef struct helmet_message {
+  bool isSOS;
+} helmet_message;
+
 control_message dataToSend;
+helmet_message incomingHelmetData;
 esp_now_peer_info_t receiverInfo;
 
-// Callback de envío
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // Función silenciosa
+// Callbacks ESP-NOW
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {}
+
+void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *incomingData, int len) {
+  if (len == sizeof(helmet_message)) {
+    memcpy(&incomingHelmetData, incomingData, sizeof(incomingHelmetData));
+    isHelmetSOS = incomingHelmetData.isSOS;
+    if (isHelmetSOS) {
+      sosIndex = 0; // Reiniciar el patrón SOS
+      previousSosTime = millis();
+    }
+  }
 }
 
 void setup() {
@@ -78,7 +92,6 @@ void setup() {
   pinMode(ledHazard, OUTPUT);
   pinMode(ledCancel, OUTPUT);
 
-  // EFECTO DE ARRANQUE: Todos los LEDs encendidos (Modo Noche inicial)
   digitalWrite(ledLeft, HIGH);
   digitalWrite(ledRight, HIGH);
   digitalWrite(ledLamp, HIGH);
@@ -86,92 +99,66 @@ void setup() {
   digitalWrite(ledCancel, HIGH);
 
   analogReadResolution(12);
-
   WiFi.mode(WIFI_MODE_STA);
   esp_now_init();
   esp_now_register_send_cb((esp_now_send_cb_t)onDataSent);
+  esp_now_register_recv_cb(onDataRecv); // Escuchar al casco
 
   memcpy(receiverInfo.peer_addr, receiverMac, 6);
   receiverInfo.channel = 0;  
   receiverInfo.encrypt = false;
   esp_now_add_peer(&receiverInfo);
-  
-  Serial.println("Control Remoto Iniciado.");
 }
 
 void loop() {
   unsigned long currentMillis = millis();
 
-  // 1. LECTURA DE BATERÍA 
   int adcValue = analogRead(pinBattery);
-  float pinVoltage = (adcValue * 3.3) / 4095.0; 
-  float batVoltage = pinVoltage * 2.0; 
-  int batPercent = (batVoltage - 3.2) * 100.0 / (4.2 - 3.2);
-  batPercent = constrain(batPercent, 0, 100); 
+  float batVoltage = ((adcValue * 3.3) / 4095.0) * 2.0; 
+  int batPercent = constrain((batVoltage - 3.2) * 100.0 / (4.2 - 3.2), 0, 100); 
 
-  // --- NUEVO: IMPRIMIR BATERÍA EN EL MONITOR SERIAL CADA 2 SEGUNDOS ---
   if (currentMillis - prevSerialMillis >= 2000) {
     prevSerialMillis = currentMillis;
-    Serial.print("Bateria Control: ");
-    Serial.print(batPercent);
-    Serial.print("%  |  Voltaje real: ");
-    Serial.print(batVoltage);
-    Serial.println("V");
+    Serial.print("Bateria Control: "); Serial.print(batPercent); Serial.println("%");
   }
 
-  // 2. LECTURA DE BOTONES
   bool currentLeft = digitalRead(btnLeft);
   bool currentRight = digitalRead(btnRight);
   bool currentCancel = digitalRead(btnCancel);
   bool currentLamp = digitalRead(btnLamp);
   bool currentHazard = digitalRead(btnHazard);
-
   bool shouldSend = false;
   dataToSend = {false, false, false, false, false, (uint8_t)batPercent};
 
-  // --- 3. NUEVA LÓGICA: DETECCIÓN SIMULTÁNEA DE CANCELAR SOS ---
+  // Combo SOS Cancel
   bool comboActive = (currentCancel == LOW && currentHazard == LOW);
-  
   if (comboActive) {
-    // Si ambos están presionados y no hemos enviado el paquete aún
     if (!comboSosSent) {
       dataToSend.clickCancel = true;
       dataToSend.clickHazard = true;
       shouldSend = true;
-      comboSosSent = true; // Bloquea el envío continuo para no saturar la red
-      currentState = STATE_OFF; // Apaga los LEDs del control si estaban parpadeando
+      comboSosSent = true; 
+      currentState = STATE_OFF; 
+      isHelmetSOS = false; // Apagar la alerta en el control inmediatamente
       Serial.println("¡COMBO SOS CANCEL ENVIADO!");
     }
   } else {
-    // Si soltamos alguno de los dos botones, reiniciamos el candado del combo
     comboSosSent = false;
-
-    // Lógica normal de clics individuales (solo funciona si no estamos haciendo el combo)
-    if (currentLeft == LOW && prevLeft == HIGH) { 
-      dataToSend.clickLeft = true; shouldSend = true; currentState = STATE_LEFT; 
-    }
-    if (currentRight == LOW && prevRight == HIGH) { 
-      dataToSend.clickRight = true; shouldSend = true; currentState = STATE_RIGHT; 
-    }
-    if (currentCancel == LOW && prevCancel == HIGH) { 
-      dataToSend.clickCancel = true; shouldSend = true; currentState = STATE_OFF; 
-    }
+    if (currentLeft == LOW && prevLeft == HIGH) { dataToSend.clickLeft = true; shouldSend = true; currentState = STATE_LEFT; }
+    if (currentRight == LOW && prevRight == HIGH) { dataToSend.clickRight = true; shouldSend = true; currentState = STATE_RIGHT; }
+    if (currentCancel == LOW && prevCancel == HIGH) { dataToSend.clickCancel = true; shouldSend = true; currentState = STATE_OFF; }
     if (currentHazard == LOW && prevHazard == HIGH) { 
       dataToSend.clickHazard = true; shouldSend = true; 
       currentState = (currentState == STATE_HAZARD) ? STATE_OFF : STATE_HAZARD; 
     }
   }
 
-  // 4. LÓGICA DE PULSACIÓN LARGA (Lámpara)
-  if (currentLamp == LOW && prevLamp == HIGH) {
-    lampPressTime = currentMillis;
-    lampLongPressed = false;
-  }
+  // Pulsación Larga (Lámpara)
+  if (currentLamp == LOW && prevLamp == HIGH) { lampPressTime = currentMillis; lampLongPressed = false; }
   if (currentLamp == LOW && !lampLongPressed) {
     if (currentMillis - lampPressTime >= 3000) { 
       isDayMode = !isDayMode; 
       lampLongPressed = true; 
-      Serial.println(isDayMode ? "Modo DIA activado" : "Modo NOCHE activado");
     }
   }
   if (currentLamp == HIGH && prevLamp == LOW) {
@@ -182,51 +169,48 @@ void loop() {
     }
   }
 
-  // 5. LÓGICA DE TIEMPOS PARA PARPADEO
-  if (currentMillis - previousTime >= blinkInterval) {
-    previousTime = currentMillis;
-    flashState = !flashState;
-  }
-  if (currentMillis - prevFastBlink >= 150) { 
-    prevFastBlink = currentMillis;
-    fastFlashState = !fastFlashState;
-  }
+  // Tiempos de parpadeo
+  if (currentMillis - previousTime >= blinkInterval) { previousTime = currentMillis; flashState = !flashState; }
+  if (currentMillis - prevFastBlink >= 150) { prevFastBlink = currentMillis; fastFlashState = !fastFlashState; }
 
-  // 6. APLICAR ESTADOS A LOS LEDS (MODO DÍA/NOCHE)
-  bool baseState = isDayMode ? LOW : HIGH;
-
-  digitalWrite(ledLamp, isDayMode ? localLampState : HIGH); 
-
-  if (batPercent < 30) {
-    digitalWrite(ledCancel, fastFlashState);
+  // --- APLICACIÓN DE ESTADOS A LOS LEDS ---
+  if (isHelmetSOS) {
+    // Si hay impacto, el control toma el control total y parpadea en SOS
+    if (currentMillis - previousSosTime >= sosPattern[sosIndex]) {
+      previousSosTime = currentMillis;
+      sosIndex++;
+      if (sosIndex >= sosPatternLength) sosIndex = 0;
+    }
+    bool currentSosState = (sosIndex % 2 == 0); 
+    digitalWrite(ledLeft, currentSosState);
+    digitalWrite(ledRight, currentSosState);
+    digitalWrite(ledLamp, currentSosState);
+    digitalWrite(ledHazard, currentSosState);
+    digitalWrite(ledCancel, currentSosState);
   } else {
-    digitalWrite(ledCancel, baseState);
+    // Funcionamiento normal Día/Noche
+    bool baseState = isDayMode ? LOW : HIGH;
+    digitalWrite(ledLamp, isDayMode ? localLampState : HIGH); 
+
+    if (batPercent < 30) {
+      digitalWrite(ledCancel, fastFlashState);
+    } else {
+      digitalWrite(ledCancel, baseState);
+    }
+
+    if (currentState == STATE_LEFT) {
+      digitalWrite(ledLeft, flashState); digitalWrite(ledRight, baseState); digitalWrite(ledHazard, baseState);     
+    } else if (currentState == STATE_RIGHT) {
+      digitalWrite(ledLeft, baseState); digitalWrite(ledRight, flashState); digitalWrite(ledHazard, baseState);     
+    } else if (currentState == STATE_HAZARD) {
+      digitalWrite(ledLeft, flashState); digitalWrite(ledRight, flashState); digitalWrite(ledHazard, flashState);
+    } else { 
+      digitalWrite(ledLeft, baseState); digitalWrite(ledRight, baseState); digitalWrite(ledHazard, baseState);     
+    }
   }
 
-  if (currentState == STATE_LEFT) {
-    digitalWrite(ledLeft, flashState); 
-    digitalWrite(ledRight, baseState);      
-    digitalWrite(ledHazard, baseState);     
-  } else if (currentState == STATE_RIGHT) {
-    digitalWrite(ledLeft, baseState);       
-    digitalWrite(ledRight, flashState);
-    digitalWrite(ledHazard, baseState);     
-  } else if (currentState == STATE_HAZARD) {
-    digitalWrite(ledLeft, flashState); 
-    digitalWrite(ledRight, flashState);
-    digitalWrite(ledHazard, flashState);
-  } else { 
-    digitalWrite(ledLeft, baseState);       
-    digitalWrite(ledRight, baseState);      
-    digitalWrite(ledHazard, baseState);     
-  }
-
-  // 7. TRANSMISIÓN DE DATOS (ESP-NOW)
-  if (currentMillis - prevSendMillis >= 5000) { 
-    shouldSend = true;
-    prevSendMillis = currentMillis;
-  }
-
+  // Transmisión
+  if (currentMillis - prevSendMillis >= 5000) { shouldSend = true; prevSendMillis = currentMillis; }
   if (shouldSend) {
     esp_now_send(receiverMac, (uint8_t *) &dataToSend, sizeof(dataToSend));
     if ((dataToSend.clickLeft || dataToSend.clickRight || dataToSend.clickCancel || dataToSend.clickLamp || dataToSend.clickHazard) && !lampLongPressed && !comboActive) {
@@ -234,11 +218,7 @@ void loop() {
     }
   }
 
-  prevLeft = currentLeft;
-  prevRight = currentRight;
-  prevCancel = currentCancel;
-  prevLamp = currentLamp;
-  prevHazard = currentHazard;
-
+  prevLeft = currentLeft; prevRight = currentRight; prevCancel = currentCancel;
+  prevLamp = currentLamp; prevHazard = currentHazard;
   delay(10);
 }
