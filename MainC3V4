@@ -1,24 +1,47 @@
 #include <esp_now.h>
 #include <WiFi.h>
 
-// MAC del Casco
+// MAC address del casco (receptor) - ¡CAMBIAR POR LA TUYA!
 uint8_t receiverMac[] = {0x9C, 0xCC, 0x01, 0x7C, 0x46, 0x3C};
 
-// --- CONFIGURACIÓN DE PINES 100% SEGUROS ---
-const int btnRight = 10;   
-const int btnCancel = 1;   
-const int btnLamp = 2;     
-const int btnLeft = 3;     
-const int btnHazard = 4;   
+// --- PINES DEL CONTROL REMOTO ---
+const int btnRight = 0;
+const int btnCancel = 1;
+const int btnLamp = 2;
+const int btnHazard = 3;
+const int btnLeft = 21;
+const int pinBattery = 4; // ADC1
 
-const int pinBattery = 0;  
+// LEDs
+const int ledLamp = 5;       
+const int ledHazard = 6;      
+const int ledCancel = 7;  
+const int ledRight = 10;
+const int ledLeft = 20;
 
-// Variables de estado
+// Variables de estado de los botones
 bool prevLeft = HIGH, prevRight = HIGH;
 bool prevCancel = HIGH, prevLamp = HIGH, prevHazard = HIGH;
-unsigned long prevSendMillis = 0;
 
-// ESTRUCTURA CON LA BATERÍA
+// --- NUEVAS VARIABLES PARA MODO DÍA Y PULSACIÓN LARGA ---
+bool isDayMode = false;          // false = Noche (Retroiluminado), true = Día (Apagado)
+bool localLampState = false;     // Recuerda si prendimos o apagamos la lámpara
+unsigned long lampPressTime = 0; // Registra cuándo empezamos a presionar el botón
+bool lampLongPressed = false;    // Evita que el modo cambie varias veces en una sola pulsación
+
+// Variables de estado interno para hacer parpadear los LEDs
+enum DirectionState { STATE_OFF, STATE_LEFT, STATE_RIGHT, STATE_HAZARD };
+DirectionState currentState = STATE_OFF;
+
+// Temporizadores para el parpadeo y envío
+unsigned long previousTime = 0;
+unsigned long prevFastBlink = 0;
+unsigned long prevSendMillis = 0;
+const int blinkInterval = 400; 
+bool flashState = false;
+bool fastFlashState = false;
+
+// Estructura de datos ESP-NOW
 typedef struct control_message {
   bool clickLeft;
   bool clickRight;
@@ -31,18 +54,34 @@ typedef struct control_message {
 control_message dataToSend;
 esp_now_peer_info_t receiverInfo;
 
+// Callback de envío
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // Confirmación silenciosa
+  // Función silenciosa
 }
 
 void setup() {
-  Serial.begin(115200); 
+  Serial.begin(115200);
   
+  // Configuración de Botones
   pinMode(btnLeft, INPUT_PULLUP);
   pinMode(btnRight, INPUT_PULLUP);
   pinMode(btnCancel, INPUT_PULLUP);
   pinMode(btnLamp, INPUT_PULLUP);
   pinMode(btnHazard, INPUT_PULLUP);
+
+  // Configuración de LEDs
+  pinMode(ledLeft, OUTPUT);
+  pinMode(ledRight, OUTPUT);
+  pinMode(ledLamp, OUTPUT);
+  pinMode(ledHazard, OUTPUT);
+  pinMode(ledCancel, OUTPUT);
+
+  // EFECTO DE ARRANQUE: Todos los LEDs encendidos (Siempre arranca en Modo Noche)
+  digitalWrite(ledLeft, HIGH);
+  digitalWrite(ledRight, HIGH);
+  digitalWrite(ledLamp, HIGH);
+  digitalWrite(ledHazard, HIGH);
+  digitalWrite(ledCancel, HIGH);
 
   analogReadResolution(12);
 
@@ -59,7 +98,7 @@ void setup() {
 void loop() {
   unsigned long currentMillis = millis();
 
-  // 1. LECTURA DE BATERÍA
+  // 1. LECTURA DE BATERÍA 
   int adcValue = analogRead(pinBattery);
   float pinVoltage = (adcValue * 3.3) / 4095.0; 
   float batVoltage = pinVoltage * 2.0; 
@@ -76,40 +115,113 @@ void loop() {
   bool shouldSend = false;
   dataToSend = {false, false, false, false, false, (uint8_t)batPercent};
 
-  // 3. DETECTAR CLICS (CON LÓGICA DE COMBINACIÓN CANCEL+HAZARD)
-  if (currentLeft == LOW && prevLeft == HIGH) { dataToSend.clickLeft = true; shouldSend = true; }
-  if (currentRight == LOW && prevRight == HIGH) { dataToSend.clickRight = true; shouldSend = true; }
-  if (currentLamp == LOW && prevLamp == HIGH) { dataToSend.clickLamp = true; shouldSend = true; }
-
-  // Si presionamos Cancel...
+  // 3. DETECCIÓN DE CLICS REGULARES
+  if (currentLeft == LOW && prevLeft == HIGH) { 
+    dataToSend.clickLeft = true; shouldSend = true; 
+    currentState = STATE_LEFT;
+  }
+  if (currentRight == LOW && prevRight == HIGH) { 
+    dataToSend.clickRight = true; shouldSend = true; 
+    currentState = STATE_RIGHT;
+  }
   if (currentCancel == LOW && prevCancel == HIGH) { 
-    dataToSend.clickCancel = true; 
-    shouldSend = true; 
-    // Si Hazard ya estaba presionado, lo sumamos al paquete
-    if (currentHazard == LOW) dataToSend.clickHazard = true;
+    dataToSend.clickCancel = true; shouldSend = true; 
+    currentState = STATE_OFF;
+  }
+  if (currentHazard == LOW && prevHazard == HIGH) { 
+    dataToSend.clickHazard = true; shouldSend = true; 
+    currentState = (currentState == STATE_HAZARD) ? STATE_OFF : STATE_HAZARD;
+  }
+
+  // --- 4. LÓGICA ESPECIAL DEL BOTÓN DE LA LÁMPARA (SHORT PRESS VS LONG PRESS) ---
+  if (currentLamp == LOW && prevLamp == HIGH) {
+    // Apenas presionamos el botón
+    lampPressTime = currentMillis;
+    lampLongPressed = false;
   }
   
-  // Si presionamos Hazard...
-  if (currentHazard == LOW && prevHazard == HIGH) { 
-    dataToSend.clickHazard = true; 
-    shouldSend = true; 
-    // Si Cancel ya estaba presionado, lo sumamos al paquete (¡Esto es lo que pediste!)
-    if (currentCancel == LOW) dataToSend.clickCancel = true;
+  if (currentLamp == LOW && !lampLongPressed) {
+    // Si mantenemos el botón presionado por 3000ms (3 segundos)
+    if (currentMillis - lampPressTime >= 3000) { 
+      isDayMode = !isDayMode; // Cambiamos de modo
+      lampLongPressed = true; // Marcamos que ya se hizo la pulsación larga
+    }
   }
 
-  // 4. TRANSMISIÓN
-  if (currentMillis - prevSendMillis >= 10000) {
+  if (currentLamp == HIGH && prevLamp == LOW) {
+    // Apenas soltamos el botón
+    if (!lampLongPressed) { 
+      // Si fue una pulsación corta, encendemos/apagamos la luz normal
+      dataToSend.clickLamp = true; 
+      shouldSend = true; 
+      localLampState = !localLampState; // Invertimos el estado guardado
+    }
+  }
+  // -------------------------------------------------------------------------------
+
+  // 5. LÓGICA DE TIEMPOS PARA PARPADEO
+  if (currentMillis - previousTime >= blinkInterval) {
+    previousTime = currentMillis;
+    flashState = !flashState;
+  }
+  
+  if (currentMillis - prevFastBlink >= 150) { 
+    prevFastBlink = currentMillis;
+    fastFlashState = !fastFlashState;
+  }
+
+  // --- 6. APLICAR ESTADOS A LOS LEDS (DEPENDIENDO DEL MODO) ---
+  
+  // Determinamos cuál es el estado "base" de los LEDs
+  bool baseState = isDayMode ? LOW : HIGH;
+
+  // LED Lamp: En modo día refleja si la lámpara está prendida o no. En modo noche siempre está prendido.
+  digitalWrite(ledLamp, isDayMode ? localLampState : HIGH); 
+
+  // LED Cancel: En batería baja siempre parpadea. Si no, toma el estado base.
+  if (batPercent < 30) {
+    digitalWrite(ledCancel, fastFlashState);
+  } else {
+    digitalWrite(ledCancel, baseState);
+  }
+
+  // LEDs Direccionales y Hazard
+  if (currentState == STATE_LEFT) {
+    digitalWrite(ledLeft, flashState); 
+    digitalWrite(ledRight, baseState);      
+    digitalWrite(ledHazard, baseState);     
+  } 
+  else if (currentState == STATE_RIGHT) {
+    digitalWrite(ledLeft, baseState);       
+    digitalWrite(ledRight, flashState);
+    digitalWrite(ledHazard, baseState);     
+  } 
+  else if (currentState == STATE_HAZARD) {
+    digitalWrite(ledLeft, flashState); 
+    digitalWrite(ledRight, flashState);
+    digitalWrite(ledHazard, flashState);
+  } 
+  else { // STATE_OFF 
+    digitalWrite(ledLeft, baseState);       
+    digitalWrite(ledRight, baseState);      
+    digitalWrite(ledHazard, baseState);     
+  }
+
+  // 7. TRANSMISIÓN DE DATOS (ESP-NOW)
+  if (currentMillis - prevSendMillis >= 5000) { 
     shouldSend = true;
     prevSendMillis = currentMillis;
   }
 
   if (shouldSend) {
     esp_now_send(receiverMac, (uint8_t *) &dataToSend, sizeof(dataToSend));
-    if (dataToSend.clickLeft || dataToSend.clickRight || dataToSend.clickCancel || dataToSend.clickLamp || dataToSend.clickHazard) {
-      delay(50); 
+    // Delay anti-rebote solo si fue provocado por un botón físico (y no fue una pulsación larga)
+    if ((dataToSend.clickLeft || dataToSend.clickRight || dataToSend.clickCancel || dataToSend.clickLamp || dataToSend.clickHazard) && !lampLongPressed) {
+      delay(200); 
     }
   }
 
+  // Actualizar lectura anterior
   prevLeft = currentLeft;
   prevRight = currentRight;
   prevCancel = currentCancel;
