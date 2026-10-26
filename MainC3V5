@@ -1,0 +1,301 @@
+#include <esp_now.h>
+#include <WiFi.h>
+#include <Wire.h>
+#include <math.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
+#include <Adafruit_NeoPixel.h> 
+
+const int MPU_ADDR = 0x68;
+const int sclPin = 9;
+const int sdaPin = 10;
+const float BRAKE_THRESHOLD = 0.4; 
+const float CRASH_THRESHOLD = 2.5; 
+
+// --- CONFIGURACIÓN DE LA TIRA LED ---
+const int LED_STRIP_PIN = 6;
+const int NUM_LEDS = 144;
+Adafruit_NeoPixel strip(NUM_LEDS, LED_STRIP_PIN, NEO_GRB + NEO_KHZ800);
+
+// Nuevo orden de las secciones de la tira: Stop -> Derecha -> Frontal -> Izquierda
+#define STOP_START  0
+#define STOP_END    35
+#define RIGHT_START 36
+#define RIGHT_END   71
+#define LAMP_START  72
+#define LAMP_END    107
+#define LEFT_START  108
+#define LEFT_END    143
+
+// Colores predefinidos
+uint32_t colorBlack  = strip.Color(0, 0, 0);
+uint32_t colorWhite  = strip.Color(255, 255, 255);
+uint32_t colorRed    = strip.Color(255, 0, 0);
+uint32_t colorDimRed = strip.Color(50, 0, 0);     // Rojo tenue para luz de posición
+uint32_t colorYellow = strip.Color(255, 165, 0);  // Naranja/Amarillo para direccionales
+
+// --- PINES RESTANTES ---
+const int pinBattery = 0; // ADC1
+const int ledPower = 1;
+const int ledEspNow = 2;
+const int ledBLE = 3;
+const int buzzerLeft = 5;
+const int buzzerRight = 20; 
+
+typedef struct control_message {
+  bool clickLeft;
+  bool clickRight;
+  bool clickCancel;
+  bool clickLamp;
+  bool clickHazard;
+  uint8_t batteryPercent; 
+} control_message;
+
+typedef struct helmet_message {
+  bool isSOS;
+} helmet_message;
+
+control_message receivedData;
+helmet_message helmetData;
+
+enum DirectionState { STATE_OFF, STATE_LEFT, STATE_RIGHT, STATE_HAZARD, STATE_SOS };
+DirectionState currentState = STATE_OFF;
+
+bool isLampOn = false;
+uint8_t remoteBattery = 0;
+uint8_t helmetBattery = 0;
+
+unsigned long previousTime = 0;
+unsigned long lastEspNowRecv = 0;
+unsigned long lastBleSend = 0;
+unsigned long prevBleBlink = 0;
+unsigned long prevStrobeTime = 0; 
+const int blinkInterval = 400;
+bool flashState = false;
+bool bleBlinkState = LOW;
+bool strobeState = LOW;
+
+const int sosPattern[] = {150, 150, 150, 150, 150, 450, 450, 150, 450, 150, 450, 450, 150, 150, 150, 150, 150, 1400};
+const int sosPatternLength = 18;
+int sosIndex = 0;
+unsigned long previousSosTime = 0;
+
+BLEServer* pServer = NULL;
+BLECharacteristic* pCharacteristic = NULL;
+bool deviceConnected = false;
+
+esp_now_peer_info_t remotePeerInfo;
+bool remotePaired = false;
+
+#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+
+class MyServerCallbacks: public BLEServerCallbacks {
+    void onConnect(BLEServer* pServer) { deviceConnected = true; };
+    void onDisconnect(BLEServer* pServer) { deviceConnected = false; BLEDevice::startAdvertising(); }
+};
+
+class MyCharacteristicCallbacks: public BLECharacteristicCallbacks {
+    void onWrite(BLECharacteristic *pChar) {
+      String rxValue = pChar->getValue();
+      if (rxValue.indexOf("CANCEL_ALARM") != -1 && currentState == STATE_SOS) {
+          currentState = STATE_OFF; 
+          helmetData.isSOS = false;
+          if (remotePaired) esp_now_send(remotePeerInfo.peer_addr, (uint8_t *) &helmetData, sizeof(helmetData));
+      }
+    }
+};
+
+void onDataRecv(const esp_now_recv_info_t * info, const uint8_t *incomingData, int len) {
+  if (!remotePaired) {
+    memcpy(remotePeerInfo.peer_addr, info->src_addr, 6);
+    remotePeerInfo.channel = 0;
+    remotePeerInfo.encrypt = false;
+    esp_now_add_peer(&remotePeerInfo);
+    remotePaired = true;
+  }
+
+  if (len == sizeof(control_message)) {
+    memcpy(&receivedData, incomingData, sizeof(receivedData));
+    remoteBattery = receivedData.batteryPercent;
+    lastEspNowRecv = millis();
+
+    if (receivedData.clickHazard && receivedData.clickCancel) {
+      if (currentState == STATE_SOS) {
+        currentState = STATE_OFF;
+        helmetData.isSOS = false;
+        esp_now_send(remotePeerInfo.peer_addr, (uint8_t *) &helmetData, sizeof(helmetData));
+        return; 
+      }
+    }
+
+    if (currentState == STATE_SOS) return;
+
+    if (receivedData.clickLeft) currentState = STATE_LEFT;
+    if (receivedData.clickRight) currentState = STATE_RIGHT;
+    if (receivedData.clickCancel) currentState = STATE_OFF;
+    if (receivedData.clickLamp) isLampOn = !isLampOn; 
+    if (receivedData.clickHazard) currentState = (currentState == STATE_HAZARD) ? STATE_OFF : STATE_HAZARD;
+  }
+}
+
+void initMPU6500() {
+  Wire.begin(sdaPin, sclPin);
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x6B); Wire.write(0); Wire.endTransmission(true);
+}
+
+void readAccelData(float &gX, float &gY, float &gZ) {
+  Wire.beginTransmission(MPU_ADDR);
+  Wire.write(0x3B); Wire.endTransmission(false);
+  Wire.requestFrom(MPU_ADDR, 6, true);
+  int16_t rawX = Wire.read() << 8 | Wire.read();
+  int16_t rawY = Wire.read() << 8 | Wire.read();
+  int16_t rawZ = Wire.read() << 8 | Wire.read();
+  gX = rawX / 16384.0; gY = rawY / 16384.0; gZ = rawZ / 16384.0;
+}
+
+void fillSegment(int start, int end, uint32_t color) {
+  for(int i = start; i <= end; i++) {
+    strip.setPixelColor(i, color);
+  }
+}
+
+void setup() {
+  Serial.begin(115200);
+  
+  pinMode(ledPower, OUTPUT); pinMode(ledEspNow, OUTPUT); pinMode(ledBLE, OUTPUT);
+  pinMode(buzzerLeft, OUTPUT); pinMode(buzzerRight, OUTPUT);
+  
+  digitalWrite(ledPower, HIGH); 
+  
+  strip.begin();
+  strip.show(); 
+  
+  analogReadResolution(12);
+  initMPU6500();
+
+  WiFi.mode(WIFI_MODE_STA);
+  esp_now_init();
+  esp_now_register_recv_cb(onDataRecv);
+
+  BLEDevice::init("Casco-Inteligente");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_WRITE);
+  pCharacteristic->setCallbacks(new MyCharacteristicCallbacks());
+  pCharacteristic->addDescriptor(new BLE2902());
+  pService->start();
+  
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06); 
+  BLEDevice::startAdvertising();
+}
+
+void loop() {
+  unsigned long currentTime = millis();
+
+  int adcValue = analogRead(pinBattery);
+  float batVoltage = ((adcValue * 3.3) / 4095.0) * 2.0; 
+  helmetBattery = constrain((batVoltage - 3.2) * 100.0 / (4.2 - 3.2), 0, 100);
+
+  if (currentTime - lastEspNowRecv < 15000 && lastEspNowRecv > 0) {
+    digitalWrite(ledEspNow, HIGH); 
+  } else { digitalWrite(ledEspNow, LOW); }
+
+  if (deviceConnected) {
+    digitalWrite(ledBLE, HIGH); 
+  } else {
+    if (currentTime - prevBleBlink >= 800) {
+      prevBleBlink = currentTime;
+      bleBlinkState = !bleBlinkState;
+      digitalWrite(ledBLE, bleBlinkState); 
+    }
+  }
+
+  if (deviceConnected && (currentTime - lastBleSend >= 5000) && currentState != STATE_SOS) {
+    lastBleSend = currentTime;
+    String payload = "H_BAT:" + String(helmetBattery) + ",R_BAT:" + String(remoteBattery);
+    pCharacteristic->setValue(payload.c_str());
+    pCharacteristic->notify();
+  }
+
+  float gX, gY, gZ;
+  readAccelData(gX, gY, gZ);
+  float gTotal = sqrt(gX * gX + gY * gY + gZ * gZ);
+  
+  if (gTotal > CRASH_THRESHOLD) {
+    if (currentState != STATE_SOS) {
+      currentState = STATE_SOS;
+      sosIndex = 0; 
+      previousSosTime = currentTime;
+      
+      if (deviceConnected) { pCharacteristic->setValue("CRASH"); pCharacteristic->notify(); }
+      helmetData.isSOS = true;
+      if (remotePaired) esp_now_send(remotePeerInfo.peer_addr, (uint8_t *) &helmetData, sizeof(helmetData));
+    }
+  }
+  
+  if (currentState == STATE_SOS) {
+    if (currentTime - previousSosTime >= sosPattern[sosIndex]) {
+      previousSosTime = currentTime; sosIndex++;
+      if (sosIndex >= sosPatternLength) sosIndex = 0;
+    }
+    bool currentSosState = (sosIndex % 2 == 0); 
+    uint32_t sosColor = currentSosState ? colorRed : colorBlack;
+    fillSegment(0, NUM_LEDS - 1, sosColor);
+
+    digitalWrite(buzzerLeft, currentSosState); 
+    digitalWrite(buzzerRight, currentSosState);
+  } else {
+    // 1. Luz de Frente (Lámpara)
+    fillSegment(LAMP_START, LAMP_END, isLampOn ? colorWhite : colorBlack);
+
+    // 2. Luz de Freno
+    if (gY > BRAKE_THRESHOLD || gY < -BRAKE_THRESHOLD) {
+      if (currentTime - prevStrobeTime >= 50) {
+        prevStrobeTime = currentTime;
+        strobeState = !strobeState;
+      }
+      fillSegment(STOP_START, STOP_END, strobeState ? colorRed : colorBlack);
+    } else {
+      fillSegment(STOP_START, STOP_END, colorDimRed); 
+    }
+
+    // 3. Temporizador para Direccionales / Intermitentes
+    if (currentTime - previousTime >= blinkInterval) {
+      previousTime = currentTime; 
+      flashState = !flashState;
+    }
+
+    // 4. Lógica de Direccionales
+    if (currentState == STATE_LEFT) {
+      fillSegment(LEFT_START, LEFT_END, flashState ? colorYellow : colorBlack);
+      fillSegment(RIGHT_START, RIGHT_END, colorBlack);
+      digitalWrite(buzzerLeft, flashState); 
+      digitalWrite(buzzerRight, LOW);
+    } else if (currentState == STATE_RIGHT) {
+      fillSegment(LEFT_START, LEFT_END, colorBlack);
+      fillSegment(RIGHT_START, RIGHT_END, flashState ? colorYellow : colorBlack);
+      digitalWrite(buzzerLeft, LOW); 
+      digitalWrite(buzzerRight, flashState);
+    } else if (currentState == STATE_HAZARD) {
+      fillSegment(LEFT_START, LEFT_END, flashState ? colorYellow : colorBlack);
+      fillSegment(RIGHT_START, RIGHT_END, flashState ? colorYellow : colorBlack);
+      digitalWrite(buzzerLeft, flashState); 
+      digitalWrite(buzzerRight, flashState);
+    } else if (currentState == STATE_OFF) {
+      fillSegment(LEFT_START, LEFT_END, colorBlack);
+      fillSegment(RIGHT_START, RIGHT_END, colorBlack);
+      digitalWrite(buzzerLeft, LOW); 
+      digitalWrite(buzzerRight, LOW);
+    }
+  }
+
+  strip.show(); 
+}
